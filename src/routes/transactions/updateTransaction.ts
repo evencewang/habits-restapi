@@ -9,27 +9,32 @@ import { Request, Response, Router } from "express";
 import { validateRequest } from "../../middlewares";
 import { body, param } from "express-validator";
 import { ResBody } from "../../types";
-import { Property, Transaction } from "../../models";
+import { Property, PropertyDocument, Transaction } from "../../models";
 import { notDeletedCondition } from "../../util";
 import { NotFoundError } from "../../errors";
-import mongoose from "mongoose";
+import mongoose, { ClientSession } from "mongoose";
 
 const router = Router();
 
-const updateUserPoints = async (userId: string, diffPoints: number) => {
-  const property = await Property.findOne({ userId });
+const updatePropertyAmount = async (
+  userId: string,
+  propertyId: string,
+  diffAmount: number,
+  session: ClientSession
+) => {
+  const property = await Property.findOne({ _id: propertyId, userId });
   if (!property) {
-    throw new NotFoundError(
-      "Could not locate property data for the current user."
-    );
+    throw new NotFoundError("Could not locate property data.");
   }
-  property.points += diffPoints;
-  const savedProperty = await property.save();
-  return savedProperty.points;
+  property.amount += diffAmount;
+  if (property.amountInStock) {
+    property.amountInStock -= diffAmount;
+  }
+  await property.save({ session });
 };
 
-const getDiffPoints = (oldPoints: number, newPoints: number) => {
-  return newPoints - oldPoints;
+const getDiffAmount = (oldAmount: number, newAmount: number) => {
+  return newAmount - oldAmount;
 };
 
 router.patch(
@@ -38,15 +43,17 @@ router.patch(
     param("transactionId").notEmpty().isMongoId(),
     body("title")
       .optional()
-      .notEmpty()
       .isString()
-      .isLength({ min: 2, max: 80 }),
-    body("pointsChange").optional().isInt().not().equals("0").not().isString(),
+      .isLength({ min: 2, max: 80 })
+      .withMessage(
+        "Title must be a valid string with length between 2 and 80."
+      ),
+    body("amountChange").isNumeric().not().equals("0").not().isString(),
   ],
   validateRequest,
   async (req: Request, res: Response<ResBody>) => {
     const { transactionId } = req.params;
-    const { title, pointsChange } = req.body;
+    const { title, amountChange } = req.body;
     const user = req.user!;
 
     // Find transaction
@@ -54,25 +61,25 @@ router.patch(
       _id: transactionId,
       userId: user.id,
       ...notDeletedCondition,
-    });
+    })
+      .populate("property", "_id name")
+      .exec();
     if (!transaction) {
       throw new NotFoundError(
         `Transaction "${transactionId}" could not be found.`
       );
     }
+    const transactionProperty = transaction.property as PropertyDocument;
+
     // Create a copy of the old transaction to return.
     const oldTransaction = transaction.toJSON();
 
-    // Number of points to add to the user, as a result of this modification.
-    let diffPoints = 0;
-    // pointsChange can't be 0, so this is good.
-    if (pointsChange) {
-      diffPoints = getDiffPoints(transaction.pointsChange, pointsChange);
+    // Amount of property to add to the user, as a result of this modification.
+    let diffAmount = 0;
+    // amoungChange can't be 0, so this is good.
+    if (amountChange) {
+      diffAmount = getDiffAmount(transaction.amountChange, amountChange);
     }
-
-    // Total number of points that the user has after this operation.
-    // This will be defined & returned if `diffPoints` is not 0.
-    let newPoints = undefined;
 
     const session = await mongoose.startSession();
     await session.withTransaction(async () => {
@@ -80,15 +87,20 @@ router.patch(
       if (title) {
         transaction.title = title;
       }
-      if (pointsChange) {
-        transaction.pointsChange = pointsChange;
+      if (amountChange) {
+        transaction.amountChange = amountChange;
       }
-      await transaction.save();
+      await transaction.save({ session });
       // === END Update transaction document
 
       // === Update user points, if needed
-      if (diffPoints) {
-        newPoints = await updateUserPoints(user.id, diffPoints);
+      if (diffAmount) {
+        await updatePropertyAmount(
+          user.id,
+          transactionProperty._id as string,
+          diffAmount,
+          session
+        );
       }
       // === END Update user points
     });
@@ -99,7 +111,6 @@ router.patch(
       payload: {
         transaction,
         updatedFrom: oldTransaction,
-        points: newPoints,
       },
     });
   }
